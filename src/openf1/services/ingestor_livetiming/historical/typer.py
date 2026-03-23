@@ -31,7 +31,7 @@ class Typer(typer.Typer):
                         else:
                             loop = new_event_loop()
                             try:
-                                return loop.run_until_complete(func(*args, **_kwargs))
+                                return loop.run_until_complete(func(*_args, **_kwargs))
                             finally:
                                 loop.close()
 

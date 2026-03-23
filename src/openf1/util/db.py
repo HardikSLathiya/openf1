@@ -311,12 +311,19 @@ async def insert_data_async(
     collection = _get_mongo_db_async()[collection_name]
 
     try:
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 collection.bulk_write([InsertOne(doc) for doc in batch], ordered=False)
                 for batch in batched(docs, batch_size)
-            ]
+            ],
+            return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, BulkWriteError):
+                for error in result.details.get("writeErrors", []):
+                    logger.error(f"Error during bulk write operation: {error}")
+            elif isinstance(result, Exception):
+                logger.exception(f"Error during bulk write operation: {result}")
     except BulkWriteError as bwe:
         for error in bwe.details.get("writeErrors", []):
             logger.error(f"Error during bulk write operation: {error}")

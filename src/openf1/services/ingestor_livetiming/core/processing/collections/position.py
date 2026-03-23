@@ -30,7 +30,6 @@ class PositionCollection(Collection):
     def process_message(self, message: Message) -> Iterator[Position]:
         if "Lines" not in message.content:
             return
-
         for driver_number, data in message.content["Lines"].items():
             try:
                 yield Position(

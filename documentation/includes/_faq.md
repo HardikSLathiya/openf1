@@ -13,4 +13,4 @@ As a point of reference, F1 TV typically has a 6-second delay.
 
 ### Is there a query timeout?
 
-Queries are limited to a 10 seconds timeout. If your request takes too long, consider breaking it down into smaller queries and then combining the results.
+Queries are limited to a 5 seconds timeout. If your request takes too long, consider breaking it down into smaller queries and then combining the results.

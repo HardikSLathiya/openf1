@@ -42,13 +42,14 @@ from openf1.util.schedule import get_session_keys
 
 cli = typer.Typer()
 http_client_async = None
+_DEFAULT_MAX_CONCURRENT = 10
 
 # Flag to determine if the script is being run from the command line
 _is_called_from_cli = False
 
 
 def get_http_client_async():
-    """Creates an async HTTP client with an indefinite TTL only when called (lazy loading)"""
+    """Returns a lazily-initialized aiohttp.ClientSession singleton with no per-request timeout."""
     global http_client_async
     if http_client_async is None:
         http_client_async = aiohttp.ClientSession(
@@ -58,13 +59,13 @@ def get_http_client_async():
 
 
 async def http_client_cleanup():
-    """Closes the async HTTP client and marks it for garbage collection."""
+    """Closes the async HTTP client session and clears the module-level reference."""
     global http_client_async
     try:
         if http_client_async is not None:
             await http_client_async.close()
     except Exception:
-        pass
+        logger.warning("Failed to close async HTTP client", exc_info=True)
     finally:
         http_client_async = None
 
@@ -150,6 +151,7 @@ async def _get_topic_content_async(session_url: str, topic: str):
     url_topic = join_url(session_url, topic_filename)
 
     response = await get_http_client_async().get(url_topic)
+    response.raise_for_status()
     topic_content = await response.text()
 
     return topic_content.split("\r\n")
@@ -452,15 +454,26 @@ async def ingest_collections(
         logger.info(f"Inserting documents to DB for session {session_key}")
 
     if parallel:
-        await asyncio.gather(
+        collections_list = list(docs_by_collection.items())
+        results = await asyncio.gather(
             *[
                 insert_data_async(
                     collection_name=collection,
                     docs=[d.to_mongo_doc_sync() for d in docs],
                 )
-                for collection, docs in docs_by_collection.items()
-            ]
+                for collection, docs in collections_list
+            ],
+            return_exceptions=True,
         )
+        failed = []
+        for (collection, _), result in zip(collections_list, results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to insert into '{collection}': {result}")
+                failed.append(collection)
+        if failed:
+            raise RuntimeError(
+                f"Failed to insert into collections: {failed}"
+            )
     else:
         for collection, docs in tqdm(
             list(docs_by_collection.items()), disable=not verbose
@@ -529,6 +542,7 @@ async def ingest_session(
     session_key: int,
     parallel: bool = False,
     resume: bool = False,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
     verbose: bool = True,
 ):
     if verbose:
@@ -584,6 +598,9 @@ async def ingest_session(
     except Exception:
         logger.exception(f"Session {session_key} ingestion failed")
         raise
+    finally:
+        # Clear cached topic content to free memory between sessions
+        _get_topic_content_async.cache_clear()
 
 
 @cli.command()
@@ -593,6 +610,7 @@ async def ingest_meeting(
     parallel: bool = False,
     by_session: bool = False,
     resume: bool = False,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
     verbose: bool = True,
 ):
     if verbose:
@@ -604,19 +622,27 @@ async def ingest_meeting(
         logger.info(f"{len(session_keys)} sessions found: {session_keys}")
 
     if parallel and not by_session:
-        await asyncio.gather(
-            *[
-                ingest_session(
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _limited_ingest_session(sk):
+            async with sem:
+                return await ingest_session(
                     year=year,
                     meeting_key=meeting_key,
-                    session_key=session_key,
+                    session_key=sk,
                     parallel=parallel,
                     resume=resume,
+                    max_concurrent=max_concurrent,
                     verbose=verbose,
                 )
-                for session_key in session_keys
-            ]
+
+        results = await asyncio.gather(
+            *[_limited_ingest_session(sk) for sk in session_keys],
+            return_exceptions=True,
         )
+        for session_key, result in zip(session_keys, results):
+            if isinstance(result, Exception):
+                logger.error(f"Session {session_key} failed: {result}")
     else:
         for session_key in session_keys:
             await ingest_session(
@@ -625,6 +651,7 @@ async def ingest_meeting(
                 session_key=session_key,
                 parallel=parallel,
                 resume=resume,
+                max_concurrent=max_concurrent,
                 verbose=verbose,
             )
 
@@ -635,6 +662,7 @@ async def ingest_season(
     parallel: bool = False,
     by_meeting: bool = False,
     resume: bool = False,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
     verbose: bool = True,
 ):
     meeting_keys = get_meeting_keys(year)
@@ -642,18 +670,26 @@ async def ingest_season(
         logger.info(f"{len(meeting_keys)} meetings found: {meeting_keys}")
 
     if parallel and not by_meeting:
-        await asyncio.gather(
-            *[
-                ingest_meeting(
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _limited_ingest_meeting(mk):
+            async with sem:
+                return await ingest_meeting(
                     year=year,
-                    meeting_key=meeting_key,
+                    meeting_key=mk,
                     parallel=parallel,
                     resume=resume,
+                    max_concurrent=max_concurrent,
                     verbose=verbose,
                 )
-                for meeting_key in meeting_keys
-            ]
+
+        results = await asyncio.gather(
+            *[_limited_ingest_meeting(mk) for mk in meeting_keys],
+            return_exceptions=True,
         )
+        for meeting_key, result in zip(meeting_keys, results):
+            if isinstance(result, Exception):
+                logger.error(f"Meeting {meeting_key} failed: {result}")
     else:
         for meeting_key in meeting_keys:
             await ingest_meeting(
@@ -661,6 +697,7 @@ async def ingest_season(
                 meeting_key=meeting_key,
                 parallel=parallel,
                 resume=resume,
+                max_concurrent=max_concurrent,
                 verbose=verbose,
             )
 
