@@ -379,3 +379,59 @@ def delete_session_data_sync(session_key: int, collection_names: list[str]) -> N
             f"Deleted {result.deleted_count} documents from '{name}' "
             f"for session {session_key}"
         )
+
+
+_ingestion_log_async_index_created = False
+
+
+async def _get_ingestion_log_collection_async():
+    global _ingestion_log_async_index_created
+    collection = _get_mongo_db_async()[_INGESTION_LOG_COLLECTION]
+    if not _ingestion_log_async_index_created:
+        await collection.create_index("session_key", unique=True)
+        _ingestion_log_async_index_created = True
+    return collection
+
+
+async def get_ingestion_log_async(session_key: int) -> dict | None:
+    """Returns the ingestion log entry for a session, or None if not found."""
+    collection = await _get_ingestion_log_collection_async()
+    return await collection.find_one({"session_key": session_key})
+
+
+async def write_ingestion_log_async(entry: dict) -> None:
+    """Writes an ingestion log entry with status 'started'.
+    Uses upsert to safely overwrite any existing entry for the same session_key
+    (handles re-ingestion without --resume)."""
+    collection = await _get_ingestion_log_collection_async()
+    await collection.replace_one(
+        {"session_key": entry["session_key"]},
+        entry,
+        upsert=True,
+    )
+
+
+async def complete_ingestion_log_async(session_key: int) -> None:
+    """Marks an ingestion log entry as completed."""
+    collection = await _get_ingestion_log_collection_async()
+    await collection.update_one(
+        {"session_key": session_key},
+        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}},
+    )
+
+
+async def delete_ingestion_log_async(session_key: int) -> None:
+    """Removes an ingestion log entry."""
+    collection = await _get_ingestion_log_collection_async()
+    await collection.delete_one({"session_key": session_key})
+
+
+async def delete_session_data_async(session_key: int, collection_names: list[str]) -> None:
+    """Deletes all documents matching session_key from the given collections."""
+    db = _get_mongo_db_async()
+    for name in collection_names:
+        result = await db[name].delete_many({"session_key": session_key})
+        logger.info(
+            f"Deleted {result.deleted_count} documents from '{name}' "
+            f"for session {session_key}"
+        )
