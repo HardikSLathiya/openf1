@@ -1,3 +1,4 @@
+import asyncio
 import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import InsertOne, MongoClient, ReplaceOne
 from pymongo.errors import BulkWriteError
 
-from openf1.util.misc import hash_obj, timed_cache
+from openf1.util.misc import batched, hash_obj, timed_cache
 
 _MONGO_CONNECTION_STRING = os.getenv("MONGO_CONNECTION_STRING")
 _MONGO_DATABASE = os.getenv("OPENF1_DB_NAME", "openf1-livetiming")
@@ -262,44 +263,6 @@ def get_latest_session_info() -> dict:
         raise SystemError("Could not find any past or current session in MongoDB")
 
 
-@timed_cache(1800)  # Cache the output for 30 minutes
-def get_closest_session_info() -> dict:
-    """Returns the session closest to the current time"""
-    sessions = _get_mongo_db_sync()["sessions"]
-    now = datetime.now(timezone.utc)
-
-    # First, try to find an active session
-    active_session = sessions.find_one(
-        {"date_start": {"$lte": now}, "date_end": {"$gte": now}}
-    )
-
-    if active_session:
-        return active_session
-
-    # If no active session, find the closest one
-    # Get the most recent past session (by end time)
-    past_session = sessions.find_one(
-        {"date_end": {"$lt": now}}, sort=[("date_end", -1)]
-    )
-
-    # Get the nearest future session (by start time)
-    future_session = sessions.find_one(
-        {"date_start": {"$gt": now}}, sort=[("date_start", 1)]
-    )
-
-    # Return whichever is closer
-    if past_session and future_session:
-        past_diff = (now - past_session["date_end"]).total_seconds()
-        future_diff = (future_session["date_start"] - now).total_seconds()
-        return past_session if past_diff <= future_diff else future_session
-    elif past_session:
-        return past_session
-    elif future_session:
-        return future_session
-    else:
-        raise SystemError("Could not find any session in MongoDB")
-
-
 @lru_cache()
 def session_key_to_path(session_key: int) -> str | None:
     sessions = _get_mongo_db_sync()["sessions"]
@@ -342,14 +305,77 @@ def upsert_data_sync(collection_name: str, docs: list[dict], batch_size: int = 5
         collection.bulk_write(operations, ordered=False)
 
 
-async def insert_data_async(collection_name: str, docs: list[dict]):
+async def insert_data_async(
+    collection_name: str, docs: list[dict], batch_size: int = 50_000
+):
     collection = _get_mongo_db_async()[collection_name]
 
     try:
-        operations = [InsertOne(doc) for doc in docs]
-        await collection.bulk_write(operations, ordered=False)
+        await asyncio.gather(
+            *[
+                collection.bulk_write([InsertOne(doc) for doc in batch], ordered=False)
+                for batch in batched(docs, batch_size)
+            ]
+        )
     except BulkWriteError as bwe:
         for error in bwe.details.get("writeErrors", []):
             logger.error(f"Error during bulk write operation: {error}")
     except Exception:
         logger.exception("Error during bulk write operation")
+
+
+_INGESTION_LOG_COLLECTION = "ingestion_log"
+_ingestion_log_index_created = False
+
+
+def _get_ingestion_log_collection_sync():
+    global _ingestion_log_index_created
+    collection = _get_mongo_db_sync()[_INGESTION_LOG_COLLECTION]
+    if not _ingestion_log_index_created:
+        collection.create_index("session_key", unique=True)
+        _ingestion_log_index_created = True
+    return collection
+
+
+def get_ingestion_log_sync(session_key: int) -> dict | None:
+    """Returns the ingestion log entry for a session, or None if not found."""
+    collection = _get_ingestion_log_collection_sync()
+    return collection.find_one({"session_key": session_key})
+
+
+def write_ingestion_log_sync(entry: dict) -> None:
+    """Writes an ingestion log entry with status 'started'.
+    Uses upsert to safely overwrite any existing entry for the same session_key
+    (handles re-ingestion without --resume)."""
+    collection = _get_ingestion_log_collection_sync()
+    collection.replace_one(
+        {"session_key": entry["session_key"]},
+        entry,
+        upsert=True,
+    )
+
+
+def complete_ingestion_log_sync(session_key: int) -> None:
+    """Marks an ingestion log entry as completed."""
+    collection = _get_ingestion_log_collection_sync()
+    collection.update_one(
+        {"session_key": session_key},
+        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}},
+    )
+
+
+def delete_ingestion_log_sync(session_key: int) -> None:
+    """Removes an ingestion log entry."""
+    collection = _get_ingestion_log_collection_sync()
+    collection.delete_one({"session_key": session_key})
+
+
+def delete_session_data_sync(session_key: int, collection_names: list[str]) -> None:
+    """Deletes all documents matching session_key from the given collections."""
+    db = _get_mongo_db_sync()
+    for name in collection_names:
+        result = db[name].delete_many({"session_key": session_key})
+        logger.info(
+            f"Deleted {result.deleted_count} documents from '{name}' "
+            f"for session {session_key}"
+        )
