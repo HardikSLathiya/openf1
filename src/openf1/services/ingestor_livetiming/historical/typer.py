@@ -26,7 +26,11 @@ class Typer(typer.Typer):
                     if iscoroutinefunction(func):
                         try:
                             get_running_loop()
+                            has_loop = True
                         except RuntimeError:
+                            has_loop = False
+                        
+                        if not has_loop:
                             return run(func(*_args, **_kwargs))
                         else:
                             loop = new_event_loop()
