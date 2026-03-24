@@ -33,3 +33,13 @@ python -m openf1.services.f1_scraping.starting_grid --meeting-key 1264 --session
 
 If the parameters are not provided, it will default to the latest session (last completed session, or session in progress).
 Note that this function only works with qualifying sessions.
+
+### Ingest All
+
+```bash
+nohup python -m openf1.services.f1_scraping.ingest_all_sessions --year 2024 > ingest_all_sessions_2024.log 2>&1 &
+```
+
+```bash
+nohup python -m openf1.services.f1_scraping.ingest_all_sessions --year 2025 > ingest_all_sessions_2025.log 2>&1 &
+```
